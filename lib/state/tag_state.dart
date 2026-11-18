@@ -84,6 +84,12 @@ class TagState extends ChangeNotifier {
   static final cteIntervalChr = _sig('2bb1');
   static const cteIntervalMinMs = 20;
   static const cteIntervalMaxMs = 10000;
+  // LocationX 설정 서비스 · 송신 출력 (int16 LE, 0.1 dBm, 읽기 = 설정값) — 태그 FW 1.3.0+.
+  // 연결 중에는 무선 출력을 바꿀 수 없어서 태그는 저장만 하고 연결이 끊긴 뒤 적용한다.
+  static const lxCfgSvc = '4c58c0f0-0000-4c58-9a00-6c6f63617478';
+  static const lxTxPowerChr = '4c58c0f1-0000-4c58-9a00-6c6f63617478';
+  static const txPowerMinDbm = -3.0;
+  static const txPowerMaxDbm = 6.0;
 
   /// 태그 펌웨어의 GAP Device Name (gatt_configuration.btconf).
   static const tagName = 'assettag';
@@ -509,6 +515,45 @@ class TagState extends ChangeNotifier {
       await UniversalBle.write(_id(mac), cteSvc, cteIntervalChr,
           Uint8List.fromList([units & 0xFF, units >> 8]));
       return units * 0.625;
+    } finally {
+      await _disconnect(mac);
+      _setBusy(null);
+    }
+  }
+
+  /// 송신 출력(dBm) 설정 · [dbm]이 null이면 읽기만. 태그에 설정된 값을 돌려준다
+  /// (연결이 끊긴 뒤 태그가 실제로 적용). FW 1.3.0 미만이면 작업자용 메시지로 throw.
+  Future<double?> txPowerDbm(String mac, {double? dbm}) async {
+    final r = await _op(dbm == null ? '송신 출력 읽기' : '송신 출력 설정', mac, () => _txPowerDbm(mac, dbm));
+    setStatus(dbm == null
+        ? '송신 출력 · $mac · ${r?.toStringAsFixed(1) ?? '-'} dBm'
+        : '송신 출력 설정 · $mac · ${r?.toStringAsFixed(1) ?? '-'} dBm (연결 종료 후 적용)');
+    return r;
+  }
+
+  Future<double?> _txPowerDbm(String mac, double? dbm) async {
+    _setBusy(mac.toUpperCase());
+    final remote = _remote(mac);
+    if (remote != null) {
+      try {
+        return await remote.txPower(mac.toUpperCase(), dbm: dbm);
+      } finally {
+        _setBusy(null);
+      }
+    }
+    try {
+      final s = await _connect(mac);
+      if (!_has(s, lxCfgSvc, lxTxPowerChr)) {
+        throw '이 태그에는 송신 출력 설정이 없습니다 (태그 펌웨어 1.3.0 이상 필요)';
+      }
+      if (dbm != null) {
+        final v = (dbm.clamp(txPowerMinDbm, txPowerMaxDbm) * 10).round();
+        await UniversalBle.write(_id(mac), lxCfgSvc, lxTxPowerChr,
+            Uint8List.fromList([v & 0xFF, (v >> 8) & 0xFF]));
+      }
+      final b = await UniversalBle.read(_id(mac), lxCfgSvc, lxTxPowerChr);
+      if (b.length < 2) return null;
+      return ByteData.sublistView(b).getInt16(0, Endian.little) / 10.0;
     } finally {
       await _disconnect(mac);
       _setBusy(null);

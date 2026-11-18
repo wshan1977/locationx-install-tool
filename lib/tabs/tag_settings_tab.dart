@@ -44,6 +44,8 @@ class _TagSettingsTabState extends State<TagSettingsTab> {
   // CTE 송신 주기 (ms) 입력 · 태그별 마지막 적용값
   final _intervalCtrl = TextEditingController(text: '100');
   final _appliedInterval = <String, double>{};
+  final Map<String, double?> _txPower = {}; // 태그별 송신 출력 설정값 (dBm)
+  double _txPowerSel = TagState.txPowerMaxDbm;
 
   @override
   void dispose() {
@@ -386,6 +388,15 @@ class _TagSettingsTabState extends State<TagSettingsTab> {
             ),
             const SizedBox(height: 14),
             _sectionCard(
+              Icons.settings_input_antenna,
+              '송신 출력',
+              '태그 무선 출력입니다. 기본값은 최대(+6 dBm). 낮추면 배터리가 오래 가고 벽·금속 반사가 줄어 '
+                  '위치가 덜 튈 수 있지만, 로케이터에서 먼 곳은 신호가 약해 각도가 흔들릴 수 있습니다. '
+                  '보정 › 정확도 측정으로 전후를 비교해 정하세요 (태그 FW 1.3.0 이상)',
+              _txPowerEditor(tags, t, info, busy),
+            ),
+            const SizedBox(height: 14),
+            _sectionCard(
               Icons.system_update_alt,
               '펌웨어 OTA 업데이트',
               'BLE 무선 업데이트 — LocationX 태그 펌웨어(.gbl · 앱 이미지)를 GitHub 릴리즈나 파일에서 골라 기록합니다',
@@ -623,6 +634,82 @@ class _TagSettingsTabState extends State<TagSettingsTab> {
           ),
       ],
     );
+  }
+
+  /// 송신 출력 편집: 프리셋 선택 + [태그에 적용] / [읽기].
+  Widget _txPowerEditor(TagState tags, BleTag t, BleTagInfo? info, bool busy) {
+    const presets = [(6.0, '+6 dBm · 최대 (기본)'), (3.0, '+3 dBm'), (0.0, '0 dBm'), (-3.0, '-3 dBm · 최소')];
+    final cur = _txPower[t.mac];
+    final oldFw = info != null && TagState.compareVersion(info.fw, '1.3.0') < 0;
+    String fmt(double v) => '${v > 0 ? '+' : ''}${v.toStringAsFixed(v % 1 == 0 ? 0 : 1)} dBm';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final (dbm, label) in presets)
+              ChoiceChip(
+                label: Text(label, style: const TextStyle(fontSize: 11.5)),
+                selected: _txPowerSel == dbm,
+                onSelected: busy ? null : (_) => setState(() => _txPowerSel = dbm),
+              ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: busy || t.appLoader || oldFw ? null : () => _applyTxPower(tags, t),
+              icon: const Icon(Icons.send, size: 18),
+              label: Text('${fmt(_txPowerSel)} 적용'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: busy || t.appLoader || oldFw ? null : () => _readTxPower(tags, t),
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('현재값 읽기'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '${cur == null ? '현재값 미확인' : '태그 설정값: ${fmt(cur)}'} · '
+          '적용은 태그와 연결이 끊긴 직후(몇 초 안) 반영되고 재부팅 후에도 유지됩니다',
+          style: TextStyle(fontSize: 11.5, color: Colors.grey.shade700),
+        ),
+        if (oldFw)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '이 태그는 FW ${info.fw} — 송신 출력 설정이 없습니다 (FW 1.3.0 이상으로 OTA 업데이트 필요)',
+              style: TextStyle(fontSize: 11.5, color: Colors.orange.shade800),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Future<void> _applyTxPower(TagState tags, BleTag t) async {
+    try {
+      final v = await tags.txPowerDbm(t.mac, dbm: _txPowerSel);
+      if (!mounted) return;
+      setState(() => _txPower[t.mac] = v);
+      _snack('송신 출력 ${v?.toStringAsFixed(1) ?? '-'} dBm 설정 — 연결이 끊기면 태그가 적용합니다');
+    } catch (e) {
+      _snack('송신 출력 설정 실패: $e');
+    }
+  }
+
+  Future<void> _readTxPower(TagState tags, BleTag t) async {
+    try {
+      final v = await tags.txPowerDbm(t.mac);
+      if (!mounted) return;
+      setState(() => _txPower[t.mac] = v);
+    } catch (e) {
+      _snack('송신 출력 읽기 실패: $e');
+    }
   }
 
   Future<void> _applyInterval(TagState tags, BleTag t) async {

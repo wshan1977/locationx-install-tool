@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 import 'dart:math' as math;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -9,7 +12,9 @@ import 'package:provider/provider.dart';
 import '../canvas/grid_painter.dart';
 import '../canvas/world_transform.dart';
 import '../models/vec3.dart';
+import '../services/accuracy_stats.dart';
 import '../services/calibration.dart';
+import '../services/mask_faces.dart';
 import '../state/app_state.dart';
 import '../state/mqtt_state.dart';
 import '../widgets/mqtt_connect_bar.dart';
@@ -42,6 +47,13 @@ class _RefPoint {
   double? errorFirst;
   double? errorLast;
 
+  /// 마지막 수집의 위치 표본 (월드 x, y) · 수집 시간(초) — 정확도 측정용
+  List<(double, double)> positions = [];
+  double seconds = 0;
+
+  AccuracyStats? get stats =>
+      AccuracyStats.of(positions, (world.dx, world.dy), seconds);
+
   _RefPoint(this.world);
 
   Vec3 get target =>
@@ -53,7 +65,15 @@ class _RefPoint {
 }
 
 class _CalibrationPageState extends State<CalibrationPage> {
-  static const _captureSeconds = 20;
+  int _captureSeconds = 20;
+
+  /// 저장한 측정 묶음 — 탭을 옮겨도 앱이 켜져 있는 동안 유지 (CSV로 보관)
+  static final List<AccuracyRun> _runs = [];
+  final _runName = TextEditingController();
+
+  // 로케이터 설정 점검 결과 (로케이터 이름 → locator_config 요약 또는 오류)
+  Map<String, Object>? _cfgCheck;
+  bool _checking = false;
 
   final List<_RefPoint> _points = [];
   int? _selected;
@@ -74,6 +94,7 @@ class _CalibrationPageState extends State<CalibrationPage> {
   void dispose() {
     _sub?.cancel();
     _timer?.cancel();
+    _runName.dispose();
     for (final p in _points) {
       p.dispose();
     }
@@ -108,8 +129,9 @@ class _CalibrationPageState extends State<CalibrationPage> {
         const TabGuide(
           icon: Icons.tune,
           text: '작업 순서: ① 내부망 MQTT 연결 → ② 도면에서 태그를 놓은 곳을 클릭(로케이터 근처는 바로 아래로 맞춤)'
-              ' → ③ [수집] 20초 — 3곳 이상 → ④ [보정 계산] → ⑤ [적용] 후 서버로 전송 → '
-              '⑥ 같은 기준점에서 다시 [수집]해 위치 오차가 줄었는지 검증',
+              ' → ③ [수집] — 3곳 이상 → ④ [보정 계산] → ⑤ [적용] 후 서버로 전송 → '
+              '⑥ 같은 기준점에서 다시 [수집]해 위치 오차가 줄었는지 검증 · '
+              '정확도 측정: 수집 후 [측정 묶음 저장] → 설정을 바꿔 같은 기준점에서 다시 수집·저장해 비교',
         ),
         if (!mqtt.isConnected) const MqttConnectBar(),
         Expanded(
@@ -139,6 +161,8 @@ class _CalibrationPageState extends State<CalibrationPage> {
                     _tagRow(mqtt, tags),
                     const SizedBox(height: 10),
                     _pointsCard(mqtt),
+                    const SizedBox(height: 10),
+                    _accuracyCard(app),
                     const SizedBox(height: 10),
                     _resultCard(app),
                   ],
@@ -178,6 +202,19 @@ class _CalibrationPageState extends State<CalibrationPage> {
             onChanged:
                 _capturingIndex != null ? null : (v) => setState(() => _tag = v),
           ),
+        const SizedBox(width: 8),
+        const Text('수집', style: TextStyle(fontSize: 13)),
+        DropdownButton<int>(
+          value: _captureSeconds,
+          isDense: true,
+          items: [
+            for (final s in const [20, 30, 60])
+              DropdownMenuItem(value: s, child: Text('$s초', style: const TextStyle(fontSize: 13))),
+          ],
+          onChanged: _capturingIndex != null
+              ? null
+              : (v) => setState(() => _captureSeconds = v ?? 20),
+        ),
       ],
     );
   }
@@ -286,6 +323,268 @@ class _CalibrationPageState extends State<CalibrationPage> {
         ),
       ),
     );
+  }
+
+  // =========================================================
+  // 정확도 측정
+  // =========================================================
+  static String _m(double v) => v.isNaN ? '-' : v.toStringAsFixed(2);
+
+  /// 측정 당시 위치 계산 설정 요약 (측정 묶음에 같이 저장).
+  String _settingsSummary(AppState app) {
+    final g = app.globals;
+    String short(String mode) => mode
+        .replaceAll('SL_RTL_LOC_ESTIMATION_MODE_', '')
+        .replaceAll('_HIGH_ACCURACY', ' 고정밀')
+        .replaceAll('_FAST_RESPONSE', ' 빠른반응')
+        .replaceAll('THREE_DIM', '3D')
+        .replaceAll('TWO_DIM', '2D');
+    return [
+      short(g.estimationModeLocation),
+      '위치필터 ${g.locationFiltering ? g.locationFilteringWeight : '끔'}',
+      if (g.targetHeight != null) '높이고정 ${g.targetHeight}m',
+      if (g.angleOutlierDeg != null) '튐제거 ${g.angleOutlierDeg}°',
+      if (g.rssiDistanceRatio != null) '약신호제외 ×${g.rssiDistanceRatio}',
+      if (g.angleSpreadDeviation != null) '흔들림가중 ${g.angleSpreadDeviation}',
+    ].join(' · ');
+  }
+
+  Widget _accuracyCard(AppState app) {
+    final measured = [
+      for (var i = 0; i < _points.length; i++)
+        if (_points[i].stats != null) (i, _points[i].stats!),
+    ];
+    final current = AccuracyStats.pool([
+      for (final (i, s) in measured)
+        (s, AccuracyStats.errorsOf(_points[i].positions, (_points[i].world.dx, _points[i].world.dy))),
+    ]);
+    const head = TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold);
+    const cell = TextStyle(fontSize: 12);
+    TableRow row(List<String> v, {TextStyle style = cell, Color? color}) => TableRow(
+          decoration: color == null ? null : BoxDecoration(color: color),
+          children: [
+            for (final t in v)
+              Padding(padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2), child: Text(t, style: style)),
+          ],
+        );
+    return _card(
+      Icons.straighten,
+      '정확도 측정',
+      '마지막 [수집]의 위치 표본으로 계산 (수평 x·y) · 치우침 = 평균 위치와 기준점 거리, '
+          '흩어짐 = 흔들림, CEP50/95 = 표본의 50%/95%가 드는 오차',
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (measured.isEmpty)
+            Text('기준점에서 [수집]하면 여기에 결과가 나옵니다.',
+                style: TextStyle(fontSize: 12.5, color: Colors.grey.shade600))
+          else
+            Table(
+              columnWidths: const {0: FixedColumnWidth(44)},
+              children: [
+                row(['점', '표본', '치우침', '흩어짐', 'CEP50', 'CEP95'], style: head),
+                for (final (i, s) in measured)
+                  row(['${i + 1}', '${s.samples} (${s.rate.toStringAsFixed(1)}/s)', _m(s.meanError),
+                      _m(s.spread), _m(s.cep50), _m(s.cep95)]),
+                if (current != null && measured.length > 1)
+                  row(['전체', '${current.samples}', _m(current.meanError), _m(current.spread),
+                      _m(current.cep50), _m(current.cep95)],
+                      style: head, color: Colors.blueGrey.shade50),
+              ],
+            ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _runName,
+                  decoration: const InputDecoration(
+                      labelText: '측정 묶음 이름', hintText: '예) 기준선, 보정 후, 고정밀 모드', isDense: true),
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.tonalIcon(
+                onPressed: measured.isEmpty || _capturingIndex != null ? null : () => _saveRun(app),
+                icon: const Icon(Icons.bookmark_add_outlined, size: 18),
+                label: const Text('측정 묶음 저장'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(children: [
+            OutlinedButton.icon(
+              onPressed: _checking ? null : () => _checkLocatorConfigs(app),
+              icon: _checking
+                  ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.fact_check_outlined, size: 18),
+              label: const Text('로케이터 설정 점검'),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('각 로케이터에 실제 적용된 각도 계산 설정을 읽어 옵니다 (로케이터 v1.0.33+)',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+            ),
+          ]),
+          if (_cfgCheck != null) _cfgCheckTable(),
+          if (_runs.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text('측정 묶음 비교 (첫 묶음 대비 · 단위 m)', style: head),
+            const SizedBox(height: 4),
+            Table(
+              columnWidths: const {0: FlexColumnWidth(1.6)},
+              children: [
+                row(['이름', '기준점', '치우침', 'CEP50', 'CEP95'], style: head),
+                for (final r in _runs) _runRow(r, row),
+              ],
+            ),
+            for (final r in _runs)
+              Text('· ${r.name}: ${r.settings}',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade700)),
+            const SizedBox(height: 6),
+            Wrap(spacing: 8, children: [
+              OutlinedButton.icon(
+                onPressed: _exportCsv,
+                icon: const Icon(Icons.download, size: 18),
+                label: const Text('CSV 저장'),
+              ),
+              TextButton(
+                onPressed: () => setState(_runs.clear),
+                child: const Text('비교 목록 지우기'),
+              ),
+            ]),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _checkLocatorConfigs(AppState app) async {
+    final locs = app.devices.where((d) => !d.isServer).toList();
+    if (locs.isEmpty) {
+      _snack('검색된 로케이터가 없습니다 — ① Locator 설정에서 장비 검색을 먼저 하세요');
+      return;
+    }
+    setState(() => _checking = true);
+    final out = <String, Object>{};
+    await Future.wait([
+      for (final d in locs)
+        LocatorCardApi(d.ip).getConfigSummary().then((v) => out[d.device] = v,
+            onError: (Object e) => out[d.device] = '$e'),
+    ]);
+    if (!mounted) return;
+    setState(() {
+      _checking = false;
+      _cfgCheck = Map.fromEntries(out.entries.toList()..sort((a, b) => a.key.compareTo(b.key)));
+    });
+  }
+
+  Widget _cfgCheckTable() {
+    String mode(Object? v) => (v ?? '-')
+        .toString()
+        .replaceAll('SL_RTL_AOX_MODE_', '')
+        .replaceAll('REAL_TIME_', '')
+        .replaceAll('HIGH_ACCURACY', '고정밀')
+        .replaceAll('FAST_RESPONSE', '빠른반응')
+        .replaceAll('BASIC', '기본');
+    String mask(Object? v) => v is List && v.isNotEmpty
+        ? v.map((r) => r is Map ? '${r['min']}~${r['max']}' : '$r').join(',')
+        : '-';
+    final modes = <String>{};
+    final rows = <TableRow>[];
+    const st = TextStyle(fontSize: 11.5);
+    for (final e in _cfgCheck!.entries) {
+      final v = e.value;
+      if (v is! Map<String, dynamic>) {
+        rows.add(TableRow(children: [
+          Text(e.key, style: st),
+          Text('읽기 실패', style: st.copyWith(color: Colors.red.shade700)),
+          const SizedBox(), const SizedBox(), const SizedBox(),
+        ]));
+        continue;
+      }
+      final a = v['aoa'] is Map ? Map<String, dynamic>.from(v['aoa'] as Map) : null;
+      if (a != null) modes.add('${a['aoxMode']}');
+      rows.add(TableRow(children: [
+        Text(e.key, style: st),
+        Text(a == null ? '구버전(모드 미표시)' : mode(a['aoxMode']), style: st),
+        Text(a == null ? '-' : '${a['cteMode']} · ${a['cteLength']} · ${a['cteSamplingInterval']}', style: st),
+        Text(a == null ? '-' : (a['angleFiltering'] == true ? '${a['angleFilteringWeight']}' : '끔'), style: st),
+        Text('고도 ${mask(v['elevationMask'])} · 방위 ${mask(v['azimuthMask'])}', style: st),
+      ]));
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Table(
+          columnWidths: const {4: FlexColumnWidth(1.6)},
+          children: [
+            const TableRow(children: [
+              Text('로케이터', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+              Text('각도 모드', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+              Text('CTE 모드·길이·간격', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+              Text('각도 필터', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+              Text('마스크(°)', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+            ]),
+            ...rows,
+          ],
+        ),
+        if (modes.length > 1)
+          Text('⚠ 로케이터마다 각도 모드가 다릅니다 — 같은 모드로 맞춘 뒤 측정하세요',
+              style: TextStyle(fontSize: 11.5, color: Colors.orange.shade900)),
+      ]),
+    );
+  }
+
+  TableRow _runRow(AccuracyRun r, TableRow Function(List<String>, {TextStyle style, Color? color}) row) {
+    final o = r.overall, base = _runs.first.overall;
+    String delta(double v, double? b) {
+      if (o == null || b == null || identical(r, _runs.first) || b == 0) return _m(v);
+      final pct = (v - b) / b * 100;
+      return '${_m(v)} (${pct >= 0 ? '+' : ''}${pct.toStringAsFixed(0)}%)';
+    }
+    if (o == null) return row([r.name, '${r.points.length}', '-', '-', '-']);
+    return row([
+      r.name,
+      '${r.points.length}',
+      delta(o.meanError, base?.meanError),
+      delta(o.cep50, base?.cep50),
+      delta(o.cep95, base?.cep95),
+    ]);
+  }
+
+  void _saveRun(AppState app) {
+    final pts = <AccuracyPointResult>[];
+    for (var i = 0; i < _points.length; i++) {
+      final p = _points[i], s = p.stats;
+      if (s == null) continue;
+      final t = p.target;
+      pts.add(AccuracyPointResult(
+        index: i + 1, x: t.x, y: t.y, z: t.z, stats: s,
+        errors: AccuracyStats.errorsOf(p.positions, (t.x, t.y)),
+      ));
+    }
+    final name = _runName.text.trim().isEmpty ? '측정 ${_runs.length + 1}' : _runName.text.trim();
+    setState(() {
+      _runs.add(AccuracyRun(name: name, at: DateTime.now(), settings: _settingsSummary(app), points: pts));
+      _runName.clear();
+    });
+    _snack('측정 묶음 "$name" 저장 — 설정을 바꾼 뒤 같은 기준점에서 다시 수집해 비교하세요');
+  }
+
+  Future<void> _exportCsv() async {
+    final csv = '﻿${accuracyRunsCsv(_runs)}'; // 엑셀 한글 깨짐 방지 BOM
+    final stamp = DateTime.now().toIso8601String().substring(0, 16).replaceAll(':', '');
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: '정확도 측정 결과 저장',
+      fileName: 'locationx_accuracy_$stamp.csv',
+      type: FileType.custom,
+      allowedExtensions: ['csv'],
+      bytes: Uint8List.fromList(utf8.encode(csv)),
+    );
+    if (path == null) return;
+    if (!(Platform.isAndroid || Platform.isIOS)) await File(path).writeAsString(csv);
+    _snack('저장했습니다: $path');
   }
 
   // =========================================================
@@ -444,6 +743,8 @@ class _CalibrationPageState extends State<CalibrationPage> {
       setState(() {
         _capturingIndex = null;
         p.angles = angles;
+        p.positions = [for (var k = 0; k < xs.length; k++) (xs[k], ys[k])];
+        p.seconds = _captureSeconds.toDouble();
         if (xs.isNotEmpty) {
           final ex = xs.reduce((a, b) => a + b) / xs.length;
           final ey = ys.reduce((a, b) => a + b) / ys.length;
@@ -454,7 +755,7 @@ class _CalibrationPageState extends State<CalibrationPage> {
         }
       });
       if (angles.isEmpty) {
-        _snack('20초 동안 태그 $tag의 angle 메시지를 받지 못했습니다');
+        _snack('$_captureSeconds초 동안 태그 $tag의 angle 메시지를 받지 못했습니다');
       }
     });
   }

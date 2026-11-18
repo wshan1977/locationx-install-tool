@@ -89,6 +89,16 @@ class LocatorCardApi {
     return _parse(d['azimuthMask']);
   }
 
+  /// 카드의 locator_config 요약 (마스크 + 각도 계산 설정 "aoa" — 카드 상태 서버 1.7.0+).
+  /// 정확도 측정 화면의 [로케이터 설정 점검]용 (읽기 전용).
+  Future<Map<String, dynamic>> getConfigSummary() async {
+    final res = await http.get(_uri('/api/locator_config')).timeout(const Duration(seconds: 4));
+    if (res.statusCode != 200) throw 'HTTP ${res.statusCode}';
+    final d = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+    if (d['ok'] != true) throw d['error']?.toString() ?? '응답 오류';
+    return d;
+  }
+
   /// azimuthMask 적용 (빈 목록 = 해제). 카드가 aoa-antenna를 재시작한다.
   Future<List<(double, double)>?> setAzimuthMask(List<(double, double)> ranges) async {
     final res = await http

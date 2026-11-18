@@ -58,6 +58,13 @@ class LocatorBleApi {
     return (d['ms'] as num).toDouble();
   }
 
+  /// 송신 출력 쓰기([dbm] 생략 = 읽기만) → 태그에 설정된 dBm (태그 FW 1.3.0+ · 에이전트 1.1.0+).
+  Future<double?> txPower(String mac, {double? dbm}) async {
+    final d = await _post('/api/ble/txpower', {'mac': mac, if (dbm != null) 'dbm': dbm},
+        const Duration(seconds: 45));
+    return (d['dbm'] as num?)?.toDouble();
+  }
+
   /// 백그라운드 OTA 시작 (진행은 [otaStatus]로 폴링).
   Future<void> startOta(String mac, Uint8List gbl) async {
     try {
