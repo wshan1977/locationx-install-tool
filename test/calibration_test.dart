@@ -92,4 +92,25 @@ void main() {
     expect(c.toJson().containsKey('targetHeight'), isFalse);
     expect(c.toJson()['foo'], 1);
   });
+
+  test('angleCheck: 정확한 각도면 치우침 0, 틀어진 자세면 그 각도만큼', () {
+    final loc = Vec3(x: 0, y: 0, z: 3), o = Vec3(x: 0, y: 180, z: 0);
+    final target = Vec3(x: 2, y: 1, z: 0);
+    final (az, el) = simulate(loc, o, target);
+    final ok = Calib.angleCheck(o, loc, target, [(az, el), (az, el)])!;
+    expect(ok.bias, closeTo(0, 1e-6));
+    expect(ok.spread, closeTo(0, 1e-6));
+    expect(ok.azimuthDiff, closeTo(0, 1e-6));
+    expect(ok.distance, closeTo(math.sqrt(14), 1e-9));
+    // 실제로는 z축 5° 돌아간 로케이터 → 등록 orientation 기준 치우침 ≈ 5° 이하·0 초과
+    final (az2, el2) = simulate(loc, Vec3(x: 0, y: 180, z: 5), target);
+    final off = Calib.angleCheck(o, loc, target, [(az2, el2)])!;
+    expect(off.bias, greaterThan(1));
+    expect(off.bias, lessThanOrEqualTo(5.0001));
+    expect(off.positionEffect, closeTo(off.distance * math.tan(off.bias * math.pi / 180), 1e-9));
+    // 흔들림: ±1° 방위 표본
+    final j = Calib.angleCheck(o, loc, target, [(az + 1, el), (az - 1, el)])!;
+    expect(j.spread, greaterThan(0));
+    expect(Calib.angleCheck(o, loc, target, []), isNull);
+  });
 }

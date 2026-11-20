@@ -116,6 +116,44 @@ class Calib {
     );
   }
 
+  /// 로케이터 기준 단위 벡터 → (azimuth, elevation) (°).
+  static (double, double) localAngles(List<double> v) => (
+        _deg(math.atan2(v[1], v[0])),
+        _deg(math.asin(v[2].clamp(-1.0, 1.0))),
+      );
+
+  /// 기준점 1곳에서 로케이터 1대의 각도 오차.
+  /// 치우침 = 평균 측정 방향과 실제 방향 사이 각도, 흔들림 = 표본과 평균
+  /// 방향 사이 각도의 RMS. 같은 orientation [o]로 positioning이 쓰는 방향과 비교한다.
+  static AngleCheck? angleCheck(
+      Vec3 o, Vec3 locator, Vec3 target, List<(double, double)> samples) {
+    if (samples.isEmpty) return null;
+    final mean = meanLocalDir(samples);
+    final truth = trueDir(locator, target);
+    final r = rotation(o.x, o.y, o.z);
+    // 기대 방향 (로케이터 기준) = Rᵀ·실제 방향
+    final expLocal = [
+      for (var j = 0; j < 3; j++)
+        r[0][j] * truth[0] + r[1][j] * truth[1] + r[2][j] * truth[2],
+    ];
+    var ss = 0.0;
+    for (final (az, el) in samples) {
+      final a = angleBetween(localDir(az, el), mean);
+      ss += a * a;
+    }
+    final (mAz, mEl) = localAngles(mean);
+    final (eAz, eEl) = localAngles(expLocal);
+    final dx = target.x - locator.x, dy = target.y - locator.y, dz = target.z - locator.z;
+    return AngleCheck(
+      samples: samples.length,
+      measured: (mAz, mEl),
+      expected: (eAz, eEl),
+      bias: angleBetween(mean, expLocal),
+      spread: math.sqrt(ss / samples.length),
+      distance: math.sqrt(dx * dx + dy * dy + dz * dz),
+    );
+  }
+
   static double _round1(double v) => (v * 10).roundToDouble() / 10;
 
   static List<double> _nelderMead(
@@ -179,4 +217,40 @@ class CalibFit {
     required this.errorBefore,
     required this.errorAfter,
   });
+}
+
+/// 기준점 1곳 · 로케이터 1대의 각도 점검 결과 (각도 °, 거리 m).
+class AngleCheck {
+  final int samples;
+  final (double, double) measured; // 평균 측정 (azimuth, elevation)
+  final (double, double) expected; // 기준점 실제 방향 (azimuth, elevation)
+  final double bias; // 치우침
+  final double spread; // 흔들림 (RMS)
+  final double distance; // 로케이터 → 기준점
+  const AngleCheck({
+    required this.samples,
+    required this.measured,
+    required this.expected,
+    required this.bias,
+    required this.spread,
+    required this.distance,
+  });
+
+  /// 방위각 차이 (측정 − 기대, ±180°로 감음). 고도 85° 이상이면 방위각이 무의미해 null.
+  double? get azimuthDiff {
+    if (expected.$2.abs() >= 85) return null;
+    var d = measured.$1 - expected.$1;
+    while (d > 180) {
+      d -= 360;
+    }
+    while (d < -180) {
+      d += 360;
+    }
+    return d;
+  }
+
+  double get elevationDiff => measured.$2 - expected.$2;
+
+  /// 치우침이 이 거리에서 만드는 위치 어긋남 (m).
+  double get positionEffect => distance * math.tan(bias * math.pi / 180);
 }

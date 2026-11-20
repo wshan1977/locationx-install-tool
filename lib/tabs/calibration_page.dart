@@ -164,6 +164,8 @@ class _CalibrationPageState extends State<CalibrationPage> {
                     const SizedBox(height: 10),
                     _accuracyCard(app),
                     const SizedBox(height: 10),
+                    _angleCard(app),
+                    const SizedBox(height: 10),
                     _resultCard(app),
                   ],
                 ),
@@ -585,6 +587,77 @@ class _CalibrationPageState extends State<CalibrationPage> {
     if (path == null) return;
     if (!(Platform.isAndroid || Platform.isIOS)) await File(path).writeAsString(csv);
     _snack('저장했습니다: $path');
+  }
+
+  // =========================================================
+  // 로케이터별 각도 오차
+  // =========================================================
+  static String _short(String id) => id.length > 4 ? id.substring(id.length - 4) : id;
+  static String _deg(double? v) => v == null ? '-' : '${v >= 0 ? '+' : ''}${v.toStringAsFixed(1)}°';
+
+  Widget _angleCard(AppState app) {
+    const head = TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold);
+    const cell = TextStyle(fontSize: 12);
+    TableRow row(List<String> v, {TextStyle style = cell}) => TableRow(children: [
+          for (final t in v)
+            Padding(padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2), child: Text(t, style: style)),
+        ]);
+    final blocks = <Widget>[];
+    for (final l in app.placements) {
+      final checks = <(int, AngleCheck)>[];
+      for (var i = 0; i < _points.length; i++) {
+        final s = _points[i].angles[l.locatorId];
+        if (s == null || s.length < 5) continue;
+        final c = Calib.angleCheck(l.orientation, l.coordinate, _points[i].target, s);
+        if (c != null) checks.add((i, c));
+      }
+      if (checks.isEmpty) continue;
+      final bias = checks.map((e) => e.$2.bias).reduce((a, b) => a + b) / checks.length;
+      final spread = checks.map((e) => e.$2.spread).reduce((a, b) => a + b) / checks.length;
+      final warn = <String>[
+        if (bias >= 3) '치우침 큼 → 자세 보정·설치 점검',
+        if (spread >= 5) '흔들림 큼 → 반사파·가림 의심',
+        // elevation 90° = 판 정면 · 30° 미만 = 정면에서 60° 넘게 벗어남
+        if (checks.any((e) => e.$2.expected.$2 < 30)) '정면에서 60°+ 벗어난 기준점 있음',
+      ];
+      blocks.add(Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${_short(l.locatorId)} · 치우침 ${bias.toStringAsFixed(1)}° · 흔들림 ${spread.toStringAsFixed(1)}° · '
+              '${warn.isEmpty ? '정상' : warn.join(' · ')}',
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: warn.isEmpty ? Colors.green.shade800 : Colors.orange.shade900,
+              ),
+            ),
+            Table(
+              columnWidths: const {0: FixedColumnWidth(30)},
+              children: [
+                row(['점', '표본', '방위차', '고도차', '치우침', '흔들림', '위치(m)'], style: head),
+                for (final (i, c) in checks)
+                  row(['${i + 1}', '${c.samples}', _deg(c.azimuthDiff), _deg(c.elevationDiff),
+                      '${c.bias.toStringAsFixed(1)}°', '${c.spread.toStringAsFixed(1)}°', _m(c.positionEffect)]),
+              ],
+            ),
+          ],
+        ),
+      ));
+    }
+    return _card(
+      Icons.explore_outlined,
+      '로케이터별 각도 오차',
+      '마지막 [수집]의 각도를 기준점 실제 방향과 비교 (현재 orientation 기준) · '
+          '치우침 = 늘 같은 쪽으로 틀어짐(교차해도 안 사라짐), 흔들림 = 매번 다른 오차, '
+          '위치영향 = 치우침 × 거리 · 방위차는 바로 아래(고도 85°+)면 생략',
+      blocks.isEmpty
+          ? Text('기준점에서 [수집]하면 로케이터마다 각도 오차가 나옵니다.',
+              style: TextStyle(fontSize: 12.5, color: Colors.grey.shade600))
+          : Column(crossAxisAlignment: CrossAxisAlignment.start, children: blocks),
+    );
   }
 
   // =========================================================
